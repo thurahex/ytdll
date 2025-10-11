@@ -54,33 +54,49 @@ export default function Home() {
     try {
       setShowModal(true);
       setModalStage("starting");
-      // Stream the file in-page to know exact completion
+      // Decide strategy based on environment: native anchor for deploy speed
+      const useNative = process.env.NEXT_PUBLIC_NATIVE_DOWNLOAD === "1";
       setStatus("Starting download...");
-      // Optional: preflight HEAD to detect availability quickly
-      try { await fetch(dlUrl, { method: "HEAD" }); } catch {}
-      const res = await fetch(dlUrl);
-      if (!res.ok || !res.body) throw new Error("Download failed to start");
-      setModalStage("downloading");
-      // Use Response.blob() for type-safe aggregation
-      const blob = await res.blob();
-      const cd = res.headers.get("content-disposition") || "";
-      let filename = "download";
-      try {
-        const star = /filename\*=UTF-8''([^;]+)/i.exec(cd);
-        const basic = /filename="?([^";]+)"?/i.exec(cd);
-        if (star && star[1]) filename = decodeURIComponent(star[1]);
-        else if (basic && basic[1]) filename = basic[1];
-      } catch {}
-      const a = document.createElement("a");
-      a.href = URL.createObjectURL(blob);
-      a.download = filename;
-      a.style.display = "none";
-      document.body.appendChild(a);
-      a.click();
-      setTimeout(() => { try { URL.revokeObjectURL(a.href); a.remove(); } catch {} }, 4000);
-      setLastDlUrl(dlUrl);
-      setStatus("Downloaded");
-      setModalStage("done");
+      if (useNative) {
+        // Trigger browser download manager via programmatic anchor click
+        const a = document.createElement("a");
+        a.href = dlUrl;
+        a.style.display = "none";
+        a.setAttribute("download", "");
+        a.rel = "noopener";
+        document.body.appendChild(a);
+        a.click();
+        setModalStage("downloading");
+        setLastDlUrl(dlUrl);
+        setStatus("Download started — check your browser’s manager.");
+        // Optimistic finish indicator for native path
+        setTimeout(() => { if (showModal) setModalStage("done"); }, 2500);
+        setTimeout(() => { try { a.remove(); } catch {} }, 4000);
+      } else {
+        // Stream the file in-page to know exact completion
+        const res = await fetch(dlUrl);
+        if (!res.ok || !res.body) throw new Error("Download failed to start");
+        setModalStage("downloading");
+        const blob = await res.blob();
+        const cd = res.headers.get("content-disposition") || "";
+        let filename = "download";
+        try {
+          const star = /filename\*=UTF-8''([^;]+)/i.exec(cd);
+          const basic = /filename="?([^";]+)"?/i.exec(cd);
+          if (star && star[1]) filename = decodeURIComponent(star[1]);
+          else if (basic && basic[1]) filename = basic[1];
+        } catch {}
+        const a = document.createElement("a");
+        a.href = URL.createObjectURL(blob);
+        a.download = filename;
+        a.style.display = "none";
+        document.body.appendChild(a);
+        a.click();
+        setTimeout(() => { try { URL.revokeObjectURL(a.href); a.remove(); } catch {} }, 4000);
+        setLastDlUrl(dlUrl);
+        setStatus("Downloaded");
+        setModalStage("done");
+      }
     } catch (err: any) {
       setError(err?.message || "Download failed");
       setStatus("");

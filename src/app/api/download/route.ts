@@ -1,6 +1,10 @@
 import { NextResponse } from "next/server";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+// Increase serverless timeout ceiling if supported (helps large merges)
+export const maxDuration = 120;
+// Run near the user for fastest upstream throughput on Vercel
+export const preferredRegion = "auto";
 import ytdl from "@distube/ytdl-core";
 import type { Readable as NodeReadable } from "stream";
 import sanitize from "sanitize-filename";
@@ -95,7 +99,8 @@ async function ensureYtDlp(): Promise<YTDlpWrap> {
   const binDir = path.join(process.cwd(), "node_modules", ".bin");
   for (const n of binNames) candidates.push(path.join(binDir, n));
   // Cache location
-  const cacheDir = path.join(process.cwd(), "node_modules", ".cache", "yt-dlp");
+  // Prefer ephemeral tmp on serverless platforms (Vercel) for write access
+  const cacheDir = path.join(os.tmpdir(), "yt-dlp");
   for (const n of binNames) candidates.push(path.join(cacheDir, n));
 
   let found: string | null = null;
@@ -189,6 +194,7 @@ export async function GET(req: Request) {
   const mode = searchParams.get("mode") || "";
   const format = searchParams.get("format") || "best";
   const cookie = searchParams.get("cookie") || req.headers.get("x-youtube-cookie") || undefined;
+  const fastRedirect = process.env.FAST_REDIRECT === "1";
   const url = normalizeUrl(raw);
   if (!url) return NextResponse.json({ error: "Missing url" }, { status: 400 });
 
@@ -229,13 +235,56 @@ export async function GET(req: Request) {
       "Accept": "*/*",
     };
     if (cookie) headers["Cookie"] = cookie;
+    const rangeHeader = req.headers.get("range");
+    if (rangeHeader) headers["Range"] = rangeHeader;
 
     if (format.startsWith("audio")) {
       const [, fmt] = format.split(":");
-      // Use yt-dlp to extract bestaudio and ffmpeg to convert to requested format
+      // Fast path: if upstream has a matching audio stream, proxy directly
+      try {
+        const { info } = await getInfoWithFallback(url);
+        const formats = (info as any).formats || [];
+        let target: any | undefined;
+        if ((fmt || "m4a") === "m4a") {
+          target = formats.find((f: any) => (f.hasAudio && !f.hasVideo) && ((f.mimeType || "").includes("audio/mp4") || (f.mimeType || "").includes("m4a")) && f.url);
+        } else if (fmt === "opus") {
+          target = formats.find((f: any) => (f.hasAudio && !f.hasVideo) && ((f.mimeType || "").includes("audio/webm") || (f.mimeType || "").includes("opus")) && f.url);
+        }
+        if (target?.url) {
+          if (fastRedirect) {
+            // Let browser hit upstream directly to maximize throughput
+            const fileBase = fileNameFromTitle(((info as any)?.videoDetails?.title) || "audio", fmt || "m4a");
+            const redir = new NextResponse(null, {
+              status: 302,
+              headers: {
+                Location: target.url,
+                "Content-Disposition": `attachment; filename*=UTF-8''${encodeURIComponent(fileBase)}`,
+              },
+            });
+            cleanupPlayerScripts();
+            return redir;
+          }
+          const prox = await fetch(target.url, { headers });
+          if (!prox.ok || !prox.body) throw new Error(`Upstream failed (${prox.status})`);
+          const fileBase = fileNameFromTitle(((info as any)?.videoDetails?.title) || "audio", fmt || "m4a");
+          const len = prox.headers.get("content-length");
+          const type = prox.headers.get("content-type") || (fmt === "m4a" ? "audio/mp4" : "audio/ogg");
+          const response = new Response(prox.body as any, {
+            status: prox.status,
+            headers: {
+              "Content-Type": type,
+              ...(len ? { "Content-Length": len } : {}),
+              "Content-Disposition": `attachment; filename*=UTF-8''${encodeURIComponent(fileBase)}`,
+            },
+          });
+          cleanupPlayerScripts();
+          return response;
+        }
+      } catch {}
+      // Fallback: yt-dlp + ffmpeg conversion to requested format
       try {
         const yt = await ensureYtDlp();
-        const tmpDir = path.join(process.cwd(), "node_modules", ".cache", "yt-dlp-audio");
+        const tmpDir = path.join(os.tmpdir(), "yt-dlp-audio");
         try { fs.mkdirSync(tmpDir, { recursive: true }); } catch {}
         const titleInfo = await getInfoWithFallback(url);
         const baseName = fileNameFromTitle((titleInfo as any)?.info?.videoDetails?.title || "audio", fmt || "m4a");
@@ -301,23 +350,34 @@ export async function GET(req: Request) {
         }
       }
       if (target?.url) {
-        // Probe upstream via HEAD to get stable Content-Length and type
+        if (fastRedirect) {
+          const fileBase = fileNameFromTitle((info as any)?.videoDetails?.title || "video", "mp4");
+          const redir = new NextResponse(null, {
+            status: 302,
+            headers: {
+              Location: target.url,
+              "Content-Disposition": `attachment; filename*=UTF-8''${encodeURIComponent(fileBase)}`,
+            },
+          });
+          cleanupPlayerScripts();
+          return redir;
+        }
+        // Optionally skip HEAD in fast mode to reduce an extra round-trip
+        const doHead = process.env.FAST_MODE !== "1";
         let upstreamLen: string | null = null;
-        let upstreamType: string | null = null;
-        try {
-          const head = await fetch(target.url, { method: "HEAD", headers });
-          if (head.ok) {
-            upstreamLen = head.headers.get("content-length");
-            upstreamType = head.headers.get("content-type");
-          }
-        } catch {}
+        if (doHead) {
+          try {
+            const head = await fetch(target.url, { method: "HEAD", headers });
+            if (head.ok) upstreamLen = head.headers.get("content-length");
+          } catch {}
+        }
         // Proxy the muxed stream with attachment headers so browsers show download manager
         const prox = await fetch(target.url, { headers });
         if (!prox.ok || !prox.body) throw new Error(`Upstream failed (${prox.status})`);
         const fileBase = fileNameFromTitle((info as any)?.videoDetails?.title || "video", "mp4");
         const len = upstreamLen || prox.headers.get("content-length");
         const response = new Response(prox.body as any, {
-          status: 200,
+          status: prox.status,
           headers: {
             // Force octet-stream to avoid inline playback; ensure download manager
             "Content-Type": "application/octet-stream",
@@ -337,7 +397,7 @@ export async function GET(req: Request) {
         let query = "bestvideo+bestaudio/best";
         const h = parseInt(String(format).replace(/[^0-9]/g, ""), 10);
         if (!isNaN(h)) query = `bestvideo[height<=${h}]+bestaudio/best[height<=${h}]`;
-        const tmpDir = path.join(process.cwd(), "node_modules", ".cache", "yt-dlp-tmp");
+        const tmpDir = path.join(os.tmpdir(), "yt-dlp-tmp");
         try { fs.mkdirSync(tmpDir, { recursive: true }); } catch {}
         const fileBase = fileNameFromTitle(((titleInfo as any)?.info?.videoDetails?.title) || "video", "mkv");
         const tmpFile = path.join(tmpDir, `${Date.now()}-${fileBase}`);

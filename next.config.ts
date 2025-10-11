@@ -1,7 +1,10 @@
 import type { NextConfig } from "next";
+import path from "path";
 
 const nextConfig: NextConfig = {
   experimental: {},
+  // Ensure correct root for file tracing in monorepo-like setups
+  outputFileTracingRoot: path.join(__dirname, ".."),
   serverExternalPackages: [
     "@ffmpeg-installer/ffmpeg",
     "yt-dlp-wrap",
