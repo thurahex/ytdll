@@ -6,13 +6,14 @@ export const maxDuration = 120;
 // Run near the user for fastest upstream throughput on Vercel
 export const preferredRegion = "auto";
 import ytdl from "@distube/ytdl-core";
-import type { Readable as NodeReadable } from "stream";
+import { Readable as NodeReadable, PassThrough } from "stream";
 import sanitize from "sanitize-filename";
 import YTDlpWrap from "yt-dlp-wrap";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import ffmpegPathPkg from "@ffmpeg-installer/ffmpeg";
+import ffmpeg from "fluent-ffmpeg";
 // Cleanup function to remove any player script files created by dependencies
 function cleanupPlayerScripts() {
   try {
@@ -27,6 +28,12 @@ function cleanupPlayerScripts() {
 }
 // Run cleanup at import time
 cleanupPlayerScripts();
+// Configure ffmpeg path for fluent-ffmpeg
+try { ffmpeg.setFfmpegPath(ffmpegPathPkg.path); } catch {}
+
+function supportsYtDlp(): boolean {
+  return process.env.DISABLE_YTDLP !== "1";
+}
 
 function normalizeUrl(raw?: string | null): string | null {
   if (!raw) return null;
@@ -62,6 +69,7 @@ async function getInfoWithFallback(url: string) {
     } catch {
       // Try yt-dlp JSON for formats and basic metadata
       try {
+        if (!supportsYtDlp()) throw new Error("yt-dlp disabled");
         const yt = await ensureYtDlp();
         const jsonStr = await yt.execPromise(["-J", url]);
         const json = JSON.parse(jsonStr);
@@ -81,8 +89,9 @@ async function getInfoWithFallback(url: string) {
           })) : [],
         };
         return { info: infoLike, source: "yt-dlp -J" as const };
-      } catch (e3) {
-        throw e3;
+      } catch {
+        // Final fallback: minimal info structure to avoid hard failure
+        return { info: { videoDetails: { title: "", thumbnails: [] }, formats: [] } as any, source: "fallback" as const };
       }
     }
   }
@@ -281,8 +290,53 @@ export async function GET(req: Request) {
           return response;
         }
       } catch {}
+      // Python-free fallback: transcode audio via ytdl-core + ffmpeg
+      try {
+        const audioStream = ytdl(url, {
+          quality: "highestaudio",
+          filter: "audioonly",
+          requestOptions: { headers },
+        });
+        const pt = new PassThrough();
+        const outFmt = (fmt || "m4a");
+        const command = ffmpeg(audioStream)
+          .noVideo();
+        let mime = "audio/mp4";
+        let ext = outFmt;
+        if (outFmt === "mp3") {
+          command.format("mp3");
+          mime = "audio/mpeg";
+        } else if (outFmt === "wav") {
+          command.format("wav");
+          mime = "audio/wav";
+        } else if (outFmt === "opus") {
+          command.format("ogg");
+          mime = "audio/ogg";
+          ext = "ogg";
+        } else {
+          // m4a
+          command.format("mp4");
+          mime = "audio/mp4";
+          ext = "m4a";
+        }
+        command.output(pt);
+        command.on("error", () => { try { pt.destroy(); } catch {} });
+        command.run();
+        const titleInfo = await getInfoWithFallback(url);
+        const baseName = fileNameFromTitle(((titleInfo as any)?.info?.videoDetails?.title) || "audio", ext);
+        const response = new Response(nodeToWebStream(pt as unknown as NodeReadable) as any, {
+          status: 200,
+          headers: {
+            "Content-Type": mime,
+            "Content-Disposition": `attachment; filename*=UTF-8''${encodeURIComponent(baseName)}`,
+          },
+        });
+        cleanupPlayerScripts();
+        return response;
+      } catch {}
       // Fallback: yt-dlp + ffmpeg conversion to requested format
       try {
+        if (!supportsYtDlp()) throw new Error("yt-dlp disabled");
         const yt = await ensureYtDlp();
         const tmpDir = path.join(os.tmpdir(), "yt-dlp-audio");
         try { fs.mkdirSync(tmpDir, { recursive: true }); } catch {}
@@ -390,46 +444,83 @@ export async function GET(req: Request) {
       }
       throw new Error("No muxed format found");
     } catch {
-      // yt-dlp merge fallback (bestvideo+bestaudio) via ffmpeg
+      // Python-free merge fallback: ytdl-core video+audio via ffmpeg
       try {
-        const yt = await ensureYtDlp();
-        const titleInfo = await getInfoWithFallback(url);
-        let query = "bestvideo+bestaudio/best";
         const h = parseInt(String(format).replace(/[^0-9]/g, ""), 10);
-        if (!isNaN(h)) query = `bestvideo[height<=${h}]+bestaudio/best[height<=${h}]`;
-        const tmpDir = path.join(os.tmpdir(), "yt-dlp-tmp");
-        try { fs.mkdirSync(tmpDir, { recursive: true }); } catch {}
+        const videoStream = ytdl(url, {
+          quality: "highestvideo",
+          filter: (f: any) => (f.hasVideo && !f.hasAudio) && (isNaN(h) ? true : ((f.height || 0) <= h)),
+          requestOptions: { headers },
+        });
+        const audioStream = ytdl(url, {
+          quality: "highestaudio",
+          filter: "audioonly",
+          requestOptions: { headers },
+        });
+        const pt = new PassThrough();
+        const cmd = ffmpeg()
+          .input(videoStream)
+          .input(audioStream)
+          .videoCodec("copy")
+          .audioCodec("copy")
+          .format("matroska")
+          .output(pt);
+        cmd.on("error", () => { try { pt.destroy(); } catch {} });
+        cmd.run();
+        const titleInfo = await getInfoWithFallback(url);
         const fileBase = fileNameFromTitle(((titleInfo as any)?.info?.videoDetails?.title) || "video", "mkv");
-        const tmpFile = path.join(tmpDir, `${Date.now()}-${fileBase}`);
-        const args = [
-          "--no-playlist",
-          "-f", query,
-          "--merge-output-format", "mkv",
-          "--ffmpeg-location", ffmpegPathPkg.path,
-          "-o", tmpFile,
-        ];
-        // headers: user-agent and cookie if provided
-        const addHeaders: string[] = [
-          "--add-header", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
-        ];
-        if (cookie) addHeaders.push("--add-header", `Cookie: ${cookie}`);
-        await yt.execPromise([...addHeaders, ...args, url]);
-        const stat = fs.statSync(tmpFile);
-        const stream = fs.createReadStream(tmpFile);
-        // cleanup after stream ends
-        stream.once("close", () => { try { fs.unlinkSync(tmpFile); } catch {} });
-        const response = new Response(nodeToWebStream(stream as any) as any, {
+        const response = new Response(nodeToWebStream(pt as unknown as NodeReadable) as any, {
           status: 200,
           headers: {
             "Content-Type": "video/x-matroska",
-            "Content-Length": String(stat.size),
             "Content-Disposition": `attachment; filename*=UTF-8''${encodeURIComponent(fileBase)}`,
           },
         });
         cleanupPlayerScripts();
         return response;
-      } catch (e2: any) {
-        return NextResponse.json({ error: "Video download failed", detail: e2?.message || String(e2) }, { status: 500 });
+      } catch {
+        // yt-dlp merge fallback (bestvideo+bestaudio) via ffmpeg to tmp
+        try {
+          if (!supportsYtDlp()) throw new Error("yt-dlp disabled");
+          const yt = await ensureYtDlp();
+          const titleInfo = await getInfoWithFallback(url);
+          let query = "bestvideo+bestaudio/best";
+          const h = parseInt(String(format).replace(/[^0-9]/g, ""), 10);
+          if (!isNaN(h)) query = `bestvideo[height<=${h}]+bestaudio/best[height<=${h}]`;
+          const tmpDir = path.join(os.tmpdir(), "yt-dlp-tmp");
+          try { fs.mkdirSync(tmpDir, { recursive: true }); } catch {}
+          const fileBase = fileNameFromTitle(((titleInfo as any)?.info?.videoDetails?.title) || "video", "mkv");
+          const tmpFile = path.join(tmpDir, `${Date.now()}-${fileBase}`);
+          const args = [
+            "--no-playlist",
+            "-f", query,
+            "--merge-output-format", "mkv",
+            "--ffmpeg-location", ffmpegPathPkg.path,
+            "-o", tmpFile,
+          ];
+          // headers: user-agent and cookie if provided
+          const addHeaders: string[] = [
+            "--add-header", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
+          ];
+          if (cookie) addHeaders.push("--add-header", `Cookie: ${cookie}`);
+          await yt.execPromise([...addHeaders, ...args, url]);
+          const stat = fs.statSync(tmpFile);
+          const stream = fs.createReadStream(tmpFile);
+          // cleanup after stream ends
+          stream.once("close", () => { try { fs.unlinkSync(tmpFile); } catch {} });
+          const response = new Response(nodeToWebStream(stream as any) as any, {
+            status: 200,
+            headers: {
+              "Content-Type": "video/x-matroska",
+              "Content-Length": String(stat.size),
+              "Content-Disposition": `attachment; filename*=UTF-8''${encodeURIComponent(fileBase)}`,
+            },
+          });
+          cleanupPlayerScripts();
+          return response;
+        } catch (e2: any) {
+          return NextResponse.json({ error: "Video download failed", detail: e2?.message || String(e2) }, { status: 500 });
+        }
       }
     }
   } catch (err: any) {
