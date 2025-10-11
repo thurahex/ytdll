@@ -61,14 +61,8 @@ export default function Home() {
       const res = await fetch(dlUrl);
       if (!res.ok || !res.body) throw new Error("Download failed to start");
       setModalStage("downloading");
-      const reader = res.body.getReader();
-      const chunks: Uint8Array[] = [];
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        if (value) chunks.push(value);
-      }
-      const blob = new Blob(chunks, { type: res.headers.get("content-type") || "application/octet-stream" });
+      // Use Response.blob() for type-safe aggregation
+      const blob = await res.blob();
       const cd = res.headers.get("content-disposition") || "";
       let filename = "download";
       try {

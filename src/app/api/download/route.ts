@@ -130,8 +130,10 @@ function nodeToWebStream(node: NodeReadable): ReadableStream<Uint8Array> {
     },
     cancel() {
       try {
-        // @ts-ignore
-        node.destroy?.();
+        const maybeDestroy = (node as unknown as { destroy?: () => void }).destroy;
+        if (typeof maybeDestroy === "function") {
+          maybeDestroy();
+        }
       } catch {}
     },
   });
