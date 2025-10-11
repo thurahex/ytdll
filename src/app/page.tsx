@@ -1,5 +1,6 @@
 "use client";
 import { useEffect, useState } from "react";
+import Image from "next/image";
 
 export default function Home() {
   const [url, setUrl] = useState("");
@@ -138,7 +139,7 @@ export default function Home() {
             <div className="mt-4">
               <div className="grid md:grid-cols-[auto,1fr] items-start gap-4">
                 {thumbnail ? (
-                  <img src={thumbnail} alt="thumbnail" className="w-24 h-16 rounded object-cover border border-slate-700" />
+                  <Image src={thumbnail} alt="thumbnail" width={96} height={64} className="w-24 h-16 rounded object-cover border border-slate-700" unoptimized />
                 ) : null}
                 <div>
                   <div className="font-semibold">{title}</div>

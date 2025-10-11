@@ -55,11 +55,11 @@ async function getInfoWithFallback(url: string) {
   try {
     const info = await ytdl.getInfo(url);
     return { info, source: "ytdl.getInfo" as const };
-  } catch (e1) {
+  } catch {
     try {
       const info = await ytdl.getBasicInfo(url);
       return { info, source: "ytdl.getBasicInfo" as const };
-    } catch (e2) {
+    } catch {
       // Try yt-dlp JSON for formats and basic metadata
       try {
         const yt = await ensureYtDlp();
@@ -389,7 +389,7 @@ export async function GET(req: Request) {
         return response;
       }
       throw new Error("No muxed format found");
-    } catch (e1) {
+    } catch {
       // yt-dlp merge fallback (bestvideo+bestaudio) via ffmpeg
       try {
         const yt = await ensureYtDlp();
