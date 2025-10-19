@@ -10,6 +10,9 @@ export default function Home() {
   const [thumbnail, setThumbnail] = useState("");
   const [qualities, setQualities] = useState<string[]>([]);
   const [format, setFormat] = useState("720p");
+  const [cookie, setCookie] = useState("");
+  const nativeEnabled = process.env.NEXT_PUBLIC_NATIVE_DOWNLOAD === "1";
+  const [showAdvanced, setShowAdvanced] = useState(false);
   const [downloading, setDownloading] = useState(false);
   const [lastDlUrl, setLastDlUrl] = useState<string | null>(null);
   const [status, setStatus] = useState<string>("");
@@ -50,55 +53,38 @@ export default function Home() {
       setError("Please paste a YouTube URL.");
       return;
     }
-    const dlUrl = `/api/download?url=${encodeURIComponent(url)}&format=${encodeURIComponent(format)}`;
+    const dlUrl = `/api/download?url=${encodeURIComponent(url)}&format=${encodeURIComponent(format)}${cookie ? `&cookie=${encodeURIComponent(cookie)}` : ""}`;
     setDownloading(true);
     try {
       setShowModal(true);
       setModalStage("starting");
-      // Decide strategy based on environment: native anchor for deploy speed
-      const useNative = process.env.NEXT_PUBLIC_NATIVE_DOWNLOAD === "1";
-      setStatus("Starting download...");
-      if (useNative) {
-        // Trigger browser download manager via programmatic anchor click
-        const a = document.createElement("a");
-        a.href = dlUrl;
-        a.style.display = "none";
-        a.setAttribute("download", "");
-        a.rel = "noopener";
-        document.body.appendChild(a);
-        a.click();
-        setModalStage("downloading");
-        setLastDlUrl(dlUrl);
-        setStatus("Download started — check your browser’s manager.");
-        // Optimistic finish indicator for native path
-        setTimeout(() => { if (showModal) setModalStage("done"); }, 2500);
-        setTimeout(() => { try { a.remove(); } catch {} }, 4000);
-      } else {
-        // Stream the file in-page to know exact completion
-        const res = await fetch(dlUrl);
-        if (!res.ok || !res.body) throw new Error("Download failed to start");
-        setModalStage("downloading");
-        const blob = await res.blob();
-        const cd = res.headers.get("content-disposition") || "";
-        let filename = "download";
-        try {
-          const star = /filename\*=UTF-8''([^;]+)/i.exec(cd);
-          const basic = /filename="?([^";]+)"?/i.exec(cd);
-          if (star && star[1]) filename = decodeURIComponent(star[1]);
-          else if (basic && basic[1]) filename = basic[1];
-        } catch {}
-        const a = document.createElement("a");
-        a.href = URL.createObjectURL(blob);
-        a.download = filename;
-        a.style.display = "none";
-        document.body.appendChild(a);
-        a.click();
-        setTimeout(() => { try { URL.revokeObjectURL(a.href); a.remove(); } catch {} }, 4000);
-        setLastDlUrl(dlUrl);
-        setStatus("Downloaded");
-        setModalStage("done");
-      }
-    } catch (err: any) {
+      setStatus("Preparing…");
+      // Preflight to determine server mode for clearer UX
+      try {
+        const head = await fetch(`/api/download?url=${encodeURIComponent(url)}&format=${encodeURIComponent(format)}${cookie ? `&cookie=${encodeURIComponent(cookie)}` : ""}`, { method: "HEAD" });
+        const xMode = head.headers.get("x-mode");
+        if (xMode === "audio" || xMode === "muxed") {
+          setStatus("Fast path — redirect/proxy available.");
+        } else if (xMode === "merge") {
+          setStatus("Merging streams — may take longer.");
+        }
+      } catch {}
+
+      // Decide strategy: always use native anchor to avoid CORS and 302 issues
+      const a = document.createElement("a");
+      a.href = dlUrl;
+      a.style.display = "none";
+      a.setAttribute("download", "");
+      a.rel = "noopener";
+      document.body.appendChild(a);
+      a.click();
+      setModalStage("downloading");
+      setLastDlUrl(dlUrl);
+      setStatus("Download started — check your browser’s manager.");
+      setTimeout(() => { setModalStage("done"); }, 2500);
+      setTimeout(() => { try { a.remove(); } catch {} }, 4000);
+      // streaming branch removed to avoid CORS/redirect fetch failures
+      } catch (err: any) {
       setError(err?.message || "Download failed");
       setStatus("");
       setModalStage("error");
@@ -120,6 +106,11 @@ export default function Home() {
         <header className="text-center mb-8">
           <h1 className="text-3xl font-bold">YouTube Downloader</h1>
           <p className="text-slate-400 mt-2">Paste a URL, pick a format, and download.</p>
+          {nativeEnabled ? (
+            <div className="text-xs mt-2 text-green-400">Native downloads enabled for fastest speed.</div>
+          ) : (
+            <div className="text-xs mt-2 text-slate-400">Streaming mode active. Set <code>NEXT_PUBLIC_NATIVE_DOWNLOAD=1</code> for faster native downloads.</div>
+          )}
         </header>
 
         <div className="bg-slate-800 rounded-xl shadow-lg p-6">
@@ -133,6 +124,27 @@ export default function Home() {
               value={url}
               onChange={(e) => setUrl(e.target.value)}
             />
+          </div>
+
+          {/* Advanced options */}
+          <div className="mt-3">
+            <button onClick={() => setShowAdvanced((v) => !v)} className="text-xs underline text-indigo-400 hover:text-indigo-300">
+              {showAdvanced ? "Hide Advanced Options" : "Show Advanced Options"}
+            </button>
+            {showAdvanced ? (
+              <div className="mt-2">
+                <label className="block text-xs font-medium mb-1" htmlFor="cookie">YouTube Cookie (optional)</label>
+                <input
+                  id="cookie"
+                  type="text"
+                  placeholder="PREF=...; YSC=..."
+                  className="w-full rounded-lg bg-slate-700 border border-slate-600 px-3 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-500 text-xs"
+                  value={cookie}
+                  onChange={(e) => setCookie(e.target.value)}
+                />
+                <div className="text-xs text-slate-400 mt-1">Use for private or region-restricted videos.</div>
+              </div>
+            ) : null}
           </div>
 
           {thumbnail || title ? (
@@ -182,8 +194,6 @@ export default function Home() {
           {status ? (
             <div className="mt-2 text-xs text-slate-300">{status}</div>
           ) : null}
-
-          {/* Progress bar removed per request */}
 
           {lastDlUrl ? (
             <div className="mt-3 text-xs text-slate-400">
