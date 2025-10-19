@@ -32,13 +32,21 @@ cleanupPlayerScripts();
 try { ffmpeg.setFfmpegPath(ffmpegPathPkg.path); } catch {}
 
 function supportsYtDlp(): boolean {
-  return process.env.DISABLE_YTDLP !== "1";
+  const disabled = process.env.DISABLE_YTDLP === "1";
+  const vercel = (process.env.VERCEL === "1") || (String(process.env.VERCEL || "").toLowerCase() === "true");
+  const enabledOverride = process.env.ENABLE_YTDLP === "1";
+  if (disabled) return false;
+  // Default-disable on Vercel unless explicitly enabled
+  if (vercel && !enabledOverride) return false;
+  return true;
 }
 
 function normalizeUrl(raw?: string | null): string | null {
   if (!raw) return null;
+  // Strip whitespace/newlines/backticks and keep only first token
+  const cleaned = raw.trim().split(/\s+/)[0].replace(/[`]+/g, "");
   try {
-    const u = new URL(raw);
+    const u = new URL(cleaned);
     if (u.hostname.includes("youtu.be")) {
       const id = u.pathname.replace("/", "");
       return `https://www.youtube.com/watch?v=${id}`;
@@ -52,9 +60,9 @@ function normalizeUrl(raw?: string | null): string | null {
         return `https://www.youtube.com/watch?v=${u.searchParams.get("v")}`;
       }
     }
-    return raw;
+    return cleaned;
   } catch {
-    return raw;
+    return cleaned;
   }
 }
 
@@ -214,7 +222,7 @@ export async function GET(req: Request) {
       const thumb = (info as any)?.videoDetails?.thumbnails?.[0]?.url || (info as any)?.thumbnail_url || "";
       let formats = (info as any).formats || [];
       // hydrate via yt-dlp if empty
-      if (!formats.length) {
+      if (!formats.length && supportsYtDlp()) {
         try {
           const yt = await ensureYtDlp();
           const jsonStr = await yt.execPromise(["-J", url]);
